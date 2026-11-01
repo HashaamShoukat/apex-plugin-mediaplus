@@ -1,0 +1,18 @@
+{
+  "name": "apex-plugin-mediaplus",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Oracle APEX item plug-in: record audio and video, take and edit photos",
+  "license": "MIT",
+  "author": "Hashaam Shoukat (https://github.com/HashaamShoukat)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HashaamShoukat/apex-plugin-mediaplus.git"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2"
+  }
+}

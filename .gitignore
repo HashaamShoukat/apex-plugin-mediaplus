@@ -1,0 +1,8 @@
+node_modules/
+*.log
+# checks and screenshots against a private APEX instance; only the file tools are published
+qa/*
+!qa/inspect.js
+!qa/boxes.js
+!qa/fixtest.js
+!qa/verify-webm.js

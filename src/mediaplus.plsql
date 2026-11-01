@@ -1,0 +1,641 @@
+-- MediaPlus for Oracle APEX - item plug-in PL/SQL (embedded in the plug-in, no database objects)
+-- Recordings and photos are uploaded in parts while the page is open and kept in an APEX collection
+-- (one member each) until a page process copies them into the application's own table.
+--   c001 file name, c002 MIME type, c003 AUDIO / VIDEO / IMAGE, c004 item name, n001 bytes, n002 seconds,
+--   n003 / n004 photo width / height, d001 created, blob001 media, clob001 transcript
+-- The item value is the colon-separated list of the collection seq_ids of its recordings and photos.
+
+c_parts   constant varchar2(10) := '$PARTS';
+c_allow   constant number := 1.03;    -- MP4 sizes are estimated while recording: a recording may end slightly over the limit
+c_uploads constant pls_integer := 3;  -- uploads in progress per item and session
+c_spare   constant pls_integer := 5;  -- recordings per item kept beyond Maximum Recordings (reloads, other tabs)
+
+function attr ( p_item in apex_plugin.t_item, p_no in pls_integer ) return varchar2
+is
+begin
+    return p_item.attributes.get_varchar2('attribute_' || to_char(p_no, 'FM00'));
+exception
+    when others then
+        return null;
+end attr;
+
+function num ( p_val in varchar2, p_default in number ) return number
+is
+begin
+    return nvl(to_number(replace(trim(p_val), ',', '.'), '999999999990D999999', 'NLS_NUMERIC_CHARACTERS=''.,'''), p_default);
+exception
+    when others then
+        return p_default;
+end num;
+
+function msg ( p_key in varchar2, p_default in varchar2, p0 in varchar2 default null ) return varchar2
+is
+    l_text varchar2(4000) := apex_lang.message('MEDIAPLUS.' || p_key, p0);
+begin
+    if l_text is null or l_text = 'MEDIAPLUS.' || p_key then
+        l_text := replace(p_default, '%0', p0);
+    end if;
+    return l_text;
+end msg;
+
+function coll ( p_item in apex_plugin.t_item ) return varchar2
+is
+begin
+    return upper(nvl(trim(attr(p_item, 16)), 'MEDIAPLUS'));
+end coll;
+
+-- Mode: AUDIO, VIDEO, IMAGE in any combination (colon list); BOTH is the 1.x value for audio and video
+function modes ( p_item in apex_plugin.t_item ) return varchar2
+is
+begin
+    return replace(upper(nvl(attr(p_item, 1), 'AUDIO')), 'BOTH', 'AUDIO:VIDEO');
+end modes;
+
+function max_bytes ( p_item in apex_plugin.t_item ) return number
+is
+begin
+    return round(num(attr(p_item, 2), 10) * 1048576);
+end max_bytes;
+
+procedure ensure ( p_name in varchar2 )
+is
+begin
+    if not apex_collection.collection_exists(p_name) then
+        apex_collection.create_collection(p_name);
+    end if;
+end ensure;
+
+-- seq_ids in an item value (anything that is not a number is dropped)
+function seqs ( p_value in varchar2 ) return apex_t_number
+is
+    l_list apex_t_varchar2 := apex_string.split(p_value, ':');
+    l_seqs apex_t_number := apex_t_number();
+begin
+    for i in 1 .. l_list.count loop
+        if regexp_like(trim(l_list(i)), '^\d{1,12}$') then
+            l_seqs.extend;
+            l_seqs(l_seqs.count) := to_number(trim(l_list(i)));
+        end if;
+    end loop;
+    return l_seqs;
+end seqs;
+
+procedure json_header
+is
+begin
+    sys.owa_util.mime_header('application/json', false);
+    sys.htp.p('Cache-Control: no-store');
+    sys.owa_util.http_header_close;
+end json_header;
+
+procedure json_error ( p_message in varchar2 )
+is
+begin
+    apex_json.open_object;
+    apex_json.write('error', p_message);
+    apex_json.close_object;
+end json_error;
+
+procedure check_token ( p_token in varchar2 )
+is
+begin
+    if p_token is null or not regexp_like(p_token, '^[A-Za-z0-9]{8,64}$') then
+        raise_application_error(-20001, 'MediaPlus: invalid upload token');
+    end if;
+end check_token;
+
+procedure send_blob ( p_blob in out nocopy blob, p_mime in varchar2, p_name in varchar2 )
+is
+begin
+    sys.owa_util.mime_header(nvl(p_mime, 'application/octet-stream'), false);
+    sys.htp.p('Content-Length: ' || dbms_lob.getlength(p_blob));
+    sys.htp.p('Content-Disposition: inline; filename="' || regexp_replace(p_name, '[^A-Za-z0-9._ -]', '_') || '"');
+    sys.htp.p('Cache-Control: private, max-age=600');
+    sys.owa_util.http_header_close;
+    sys.wpg_docload.download_file(p_blob);
+end send_blob;
+
+procedure not_found
+is
+begin
+    sys.owa_util.status_line(404, 'Not Found', true);
+end not_found;
+
+-- the first bytes must be those of an audio / video container or a picture, whatever the browser claimed
+function is_media ( p_blob in blob, p_kind in varchar2 ) return boolean
+is
+    l_head varchar2(40) := rawtohex(dbms_lob.substr(p_blob, 12, 1));
+begin
+    if p_kind = 'IMAGE' then
+        return l_head like 'FFD8FF%'                                -- JPEG
+            or l_head like '89504E470D0A1A0A%'                      -- PNG
+            or (l_head like '52494646%' and substr(l_head, 17, 8) = '57454250')   -- WebP
+            or l_head like '47494638%'                              -- GIF
+            or (substr(l_head, 9, 8) = '66747970' and substr(l_head, 17, 8) in ('68656963', '68656978', '6D696631', '61766966')); -- HEIC / AVIF
+    end if;
+    return l_head like '1A45DFA3%'                                  -- WebM / Matroska
+        or substr(l_head, 9, 8) = '66747970'                        -- MP4 / M4A / MOV / 3GP (ftyp)
+        or l_head like '4F676753%'                                  -- Ogg
+        or (l_head like '52494646%' and substr(l_head, 17, 8) = '57415645')   -- WAV
+        or l_head like '494433%'                                    -- MP3 with ID3
+        or regexp_like(substr(l_head, 1, 3), '^FF[EF]')             -- MP3 / AAC frames
+        or l_head like '664C6143%'                                  -- FLAC
+        or l_head like '2321414D52%';                               -- AMR
+end is_media;
+
+----------------------------------------------------------------------------
+-- AJAX: one part of a recording (base64 pieces in f01)
+----------------------------------------------------------------------------
+procedure save_part ( p_item in apex_plugin.t_item )
+is
+    l_parts  varchar2(255) := coll(p_item) || c_parts;
+    l_item   varchar2(255) := p_item.name;
+    l_token  varchar2(64)  := apex_application.g_x02;
+    l_blob   blob;
+    l_raw    raw(32767);
+    l_total  number;
+    l_others pls_integer;
+    l_old    apex_t_number;
+    l_seq    number;
+begin
+    check_token(l_token);
+    ensure(l_parts);
+    -- parts of uploads that never finished
+    select seq_id bulk collect into l_old from apex_collections where collection_name = l_parts and d001 < sysdate - 1/24;
+    for i in 1 .. l_old.count loop
+        apex_collection.delete_member(l_parts, l_old(i));
+    end loop;
+
+    select nvl(sum(dbms_lob.getlength(blob001)), 0) into l_total
+      from apex_collections
+     where collection_name = l_parts and c004 = l_item and c001 = l_token;
+    select count(distinct c001) into l_others
+      from apex_collections
+     where collection_name = l_parts and c004 = l_item and c001 <> l_token;
+    if l_others >= c_uploads then
+        json_error(msg('BUSY_UPLOADS', 'Other recordings are still being saved. Please wait a moment.'));
+        return;
+    end if;
+
+    dbms_lob.createtemporary(l_blob, true, dbms_lob.call);
+    for i in 1 .. apex_application.g_f01.count loop
+        if apex_application.g_f01(i) is not null then
+            l_raw := utl_encode.base64_decode(utl_raw.cast_to_raw(apex_application.g_f01(i)));
+            dbms_lob.writeappend(l_blob, utl_raw.length(l_raw), l_raw);
+        end if;
+    end loop;
+
+    if l_total + dbms_lob.getlength(l_blob) > max_bytes(p_item) * c_allow then
+        apex_collection.delete_members(p_collection_name => l_parts, p_attr_number => 1, p_attr_value => l_token);
+        json_error(msg('TOO_LARGE', 'The file is larger than the maximum of %0 MB.', attr(p_item, 2)));
+        return;
+    end if;
+
+    l_seq := apex_collection.add_member(
+                 p_collection_name => l_parts,
+                 p_c001            => l_token,
+                 p_c004            => l_item,
+                 p_n001            => to_number(apex_application.g_x03),
+                 p_d001            => sysdate,
+                 p_blob001         => l_blob );
+    apex_json.open_object;
+    apex_json.write('ok', true);
+    apex_json.close_object;
+end save_part;
+
+----------------------------------------------------------------------------
+-- Transcription = Server: the developer's PL/SQL turns the recording into text
+----------------------------------------------------------------------------
+function transcribe ( p_item in apex_plugin.t_item, p_seq in number, p_mime in varchar2, p_lang in varchar2 ) return varchar2
+is
+    l_params apex_exec.t_parameters;
+begin
+    apex_exec.add_parameter(l_params, 'COLLECTION_NAME', coll(p_item));
+    apex_exec.add_parameter(l_params, 'SEQ_ID', p_seq);
+    apex_exec.add_parameter(l_params, 'MIME_TYPE', p_mime);
+    apex_exec.add_parameter(l_params, 'LANGUAGE', p_lang);
+    apex_exec.add_parameter(l_params, 'TRANSCRIPT', ' ');
+    apex_exec.execute_plsql(p_plsql_code => attr(p_item, 24), p_auto_bind_items => true, p_sql_parameters => l_params);
+    return trim(apex_exec.get_parameter_varchar2(l_params, 'TRANSCRIPT'));
+end transcribe;
+
+----------------------------------------------------------------------------
+-- AJAX: all parts arrived - join them into one collection member
+----------------------------------------------------------------------------
+procedure finish ( p_item in apex_plugin.t_item )
+is
+    l_coll  varchar2(255) := coll(p_item);
+    l_parts varchar2(255) := l_coll || c_parts;
+    l_item  varchar2(255) := p_item.name;
+    l_token varchar2(64)  := apex_application.g_x02;
+    l_mine  apex_t_number := seqs(apex_application.g_x05);
+    l_max   pls_integer   := greatest(1, num(attr(p_item, 5), 1));
+    l_meta  json_object_t;
+    l_mime  varchar2(255);
+    l_name  varchar2(400);
+    l_kind  varchar2(10);
+    l_mode  varchar2(30)  := modes(p_item);
+    l_dur   number;
+    l_w     number;
+    l_h     number;
+    l_text  clob;
+    l_said  varchar2(32767);
+    l_blob  blob;
+    l_count pls_integer := 0;
+    l_have  pls_integer := 0;
+    l_seq   number;
+begin
+    check_token(l_token);
+    l_meta := json_object_t.parse(nvl(apex_application.g_x03, '{}'));
+    l_mime := lower(trim(regexp_substr(l_meta.get_string('mime'), '^[^;]+')));
+    l_name := l_meta.get_string('name');
+    l_dur  := l_meta.get_number('duration');
+    l_w    := l_meta.get_number('width');
+    l_h    := l_meta.get_number('height');
+    l_text := l_meta.get_clob('transcript');
+    l_kind := case when l_mime like 'audio/%' then 'AUDIO' when l_mime like 'video/%' then 'VIDEO' when l_mime like 'image/%' then 'IMAGE' end;
+
+    ensure(l_parts);
+    dbms_lob.createtemporary(l_blob, true, dbms_lob.call);
+    for r in ( select blob001
+                 from apex_collections
+                where collection_name = l_parts
+                  and c001 = l_token
+                  and c004 = l_item
+                order by n001 )
+    loop
+        if dbms_lob.getlength(r.blob001) > 0 then
+            dbms_lob.append(l_blob, r.blob001);
+        end if;
+        l_count := l_count + 1;
+    end loop;
+    apex_collection.delete_members(p_collection_name => l_parts, p_attr_number => 1, p_attr_value => l_token);
+
+    if l_kind is null or not regexp_like(l_mime, '^(audio|video|image)/[a-z0-9.+-]{1,60}$')
+       or instr(':' || l_mode || ':', ':' || l_kind || ':') = 0 or not is_media(l_blob, l_kind)
+    then
+        json_error(msg('WRONG_TYPE', 'This kind of file is not allowed here.'));
+        return;
+    end if;
+    if l_count = 0 or l_count <> to_number(apex_application.g_x04) or dbms_lob.getlength(l_blob) = 0 then
+        json_error(msg('UPLOAD_INCOMPLETE', 'The upload was incomplete. Please try again.'));
+        return;
+    end if;
+    if dbms_lob.getlength(l_blob) > max_bytes(p_item) * c_allow then
+        json_error(msg('TOO_LARGE', 'The file is larger than the maximum of %0 MB.', attr(p_item, 2)));
+        return;
+    end if;
+
+    -- Maximum Recordings: the item's current recordings, and a hard cap for the session
+    ensure(l_coll);
+    select count(*), count(case when seq_id in (select column_value from table(l_mine)) then 1 end)
+      into l_count, l_have
+      from apex_collections
+     where collection_name = l_coll
+       and c004 = l_item;
+    if l_have >= l_max or l_count >= l_max + c_spare then
+        json_error(msg('MAX_COUNT', 'The maximum of %0 has been reached. Delete one to add another.', l_max));
+        return;
+    end if;
+
+    l_name := substr(regexp_replace(nvl(trim(l_name), 'recording'), '[^[:alnum:]._ -]', '_'), 1, 200);
+    l_seq := apex_collection.add_member(
+                 p_collection_name => l_coll,
+                 p_c001            => l_name,
+                 p_c002            => l_mime,
+                 p_c003            => l_kind,
+                 p_c004            => l_item,
+                 p_n001            => dbms_lob.getlength(l_blob),
+                 p_n002            => round(l_dur, 1),
+                 p_n003            => round(l_w),
+                 p_n004            => round(l_h),
+                 p_d001            => sysdate,
+                 p_clob001         => case when dbms_lob.getlength(l_text) > 0 then l_text end,
+                 p_blob001         => l_blob );
+
+    if attr(p_item, 19) = 'SERVER' and attr(p_item, 24) is not null and l_kind = 'AUDIO' then
+        begin
+            l_said := transcribe(p_item, l_seq, l_mime, apex_application.g_x06);
+            if l_said is not null then
+                apex_collection.update_member_attribute(p_collection_name => l_coll, p_seq => l_seq, p_clob_number => 1, p_clob_value => l_said);
+                l_text := l_said;
+            end if;
+        exception
+            when others then
+                apex_debug.error('MediaPlus %s transcription: %s', l_item, sqlerrm);
+        end;
+    end if;
+
+    apex_json.open_object;
+    apex_json.write('seq', l_seq);
+    apex_json.write('name', l_name);
+    apex_json.write('mime', l_mime);
+    apex_json.write('kind', l_kind);
+    apex_json.write('size', dbms_lob.getlength(l_blob));
+    apex_json.write('duration', round(l_dur, 1));
+    apex_json.write('width', round(l_w));
+    apex_json.write('height', round(l_h));
+    if dbms_lob.getlength(l_text) > 0 then apex_json.write('transcript', l_text); end if;
+    apex_json.close_object;
+end finish;
+
+----------------------------------------------------------------------------
+-- AJAX: stream a pending recording (collection) or a saved one (Saved Recordings Query)
+----------------------------------------------------------------------------
+procedure send_pending ( p_item in apex_plugin.t_item )
+is
+    l_coll varchar2(255) := coll(p_item);
+    l_item varchar2(255) := p_item.name;
+    l_blob blob;
+    l_mime varchar2(255);
+    l_name varchar2(400);
+begin
+    select blob001, c002, c001
+      into l_blob, l_mime, l_name
+      from apex_collections
+     where collection_name = l_coll
+       and seq_id = to_number(apex_application.g_x02)
+       and c004 = l_item;
+    send_blob(l_blob, l_mime, l_name);
+exception
+    when no_data_found or value_error or invalid_number then
+        not_found;
+end send_pending;
+
+procedure send_saved ( p_item in apex_plugin.t_item )
+is
+    l_ctx  apex_exec.t_context;
+    l_row  pls_integer := 0;
+    l_want pls_integer := to_number(apex_application.g_x02);
+    l_blob blob;
+    l_mime varchar2(255);
+    l_name varchar2(400);
+    l_cols pls_integer;
+begin
+    l_ctx  := apex_exec.open_query_context(p_location => apex_exec.c_location_local_db, p_sql_query => attr(p_item, 18));
+    l_cols := apex_exec.get_column_count(l_ctx);
+    while apex_exec.next_row(l_ctx) loop
+        l_row := l_row + 1;
+        if l_row = l_want then
+            l_blob := apex_exec.get_blob(l_ctx, 1);
+            if l_cols > 1 then l_mime := apex_exec.get_varchar2(l_ctx, 2); end if;
+            if l_cols > 2 then l_name := apex_exec.get_varchar2(l_ctx, 3); end if;
+            exit;
+        end if;
+    end loop;
+    apex_exec.close(l_ctx);
+    if l_blob is null or dbms_lob.getlength(l_blob) = 0 then
+        not_found;
+    else
+        send_blob(l_blob, l_mime, nvl(l_name, 'recording'));
+    end if;
+exception
+    when others then
+        apex_exec.close(l_ctx);
+        raise;
+end send_saved;
+
+procedure remove ( p_item in apex_plugin.t_item )
+is
+    l_coll varchar2(255) := coll(p_item);
+    l_item varchar2(255) := p_item.name;
+    l_seq  number := to_number(apex_application.g_x02);
+begin
+    for r in ( select seq_id
+                 from apex_collections
+                where collection_name = l_coll
+                  and seq_id = l_seq
+                  and c004 = l_item )
+    loop
+        apex_collection.delete_member(l_coll, r.seq_id);
+    end loop;
+    apex_json.open_object;
+    apex_json.write('ok', true);
+    apex_json.close_object;
+end remove;
+
+procedure ajax (
+    p_item   in            apex_plugin.t_item,
+    p_plugin in            apex_plugin.t_plugin,
+    p_param  in            apex_plugin.t_item_ajax_param,
+    p_result in out nocopy apex_plugin.t_item_ajax_result )
+is
+    l_req varchar2(30) := upper(apex_application.g_x01);
+begin
+    if l_req = 'GET' then
+        send_pending(p_item);
+        return;
+    elsif l_req = 'SAVED' then
+        if attr(p_item, 18) is not null then
+            send_saved(p_item);
+        else
+            not_found;
+        end if;
+        return;
+    end if;
+
+    json_header;
+    if l_req is null or l_req not in ('PART', 'FINISH', 'DELETE') then
+        json_error('MediaPlus: request not allowed');
+    elsif l_req = 'PART' then
+        save_part(p_item);
+    elsif l_req = 'FINISH' then
+        finish(p_item);
+    else
+        remove(p_item);
+    end if;
+exception
+    when others then
+        -- details go to the debug log, not to the browser
+        apex_debug.error('MediaPlus %s %s: %s %s', p_item.name, l_req, sqlerrm, dbms_utility.format_error_backtrace);
+        if l_req in ('GET', 'SAVED') then
+            not_found;
+            return;
+        end if;
+        json_error(msg('SERVER_ERROR', 'This could not be saved because of a server error. Please try again.'));
+end ajax;
+
+----------------------------------------------------------------------------
+-- render
+----------------------------------------------------------------------------
+procedure render (
+    p_item   in            apex_plugin.t_item,
+    p_plugin in            apex_plugin.t_plugin,
+    p_param  in            apex_plugin.t_item_render_param,
+    p_result in out nocopy apex_plugin.t_item_render_result )
+is
+    l_name  varchar2(255) := p_item.name;
+    l_coll  varchar2(255) := coll(p_item);
+    l_seqs  apex_t_number := seqs(p_param.value);
+    l_old   apex_t_number;
+    l_value varchar2(4000);
+    l_ro    boolean := p_param.is_readonly or p_param.is_printer_friendly;
+    l_json  clob;
+    l_ctx   apex_exec.t_context;
+    l_cols  pls_integer;
+    l_blob  blob;
+    l_row   pls_integer := 0;
+begin
+    -- forget recordings nobody refers to any more; only after an hour, so a second tab of the same session is safe
+    if apex_collection.collection_exists(l_coll) then
+        select seq_id bulk collect into l_old
+          from apex_collections
+         where collection_name = l_coll
+           and c004 = l_name
+           and d001 < sysdate - 1/24
+           and seq_id not in (select column_value from table(l_seqs));
+        for i in 1 .. l_old.count loop
+            apex_collection.delete_member(l_coll, l_old(i));
+        end loop;
+    end if;
+    if apex_collection.collection_exists(l_coll || c_parts) then
+        select seq_id bulk collect into l_old
+          from apex_collections
+         where collection_name = l_coll || c_parts
+           and d001 < sysdate - 1/24;
+        for i in 1 .. l_old.count loop
+            apex_collection.delete_member(l_coll || c_parts, l_old(i));
+        end loop;
+    end if;
+
+    apex_json.initialize_clob_output;
+    apex_json.open_object;
+    apex_json.write('item', l_name);
+    apex_json.write('label', p_item.plain_label);
+    apex_json.write('ajax', apex_plugin.get_ajax_identifier);
+    apex_json.write('mode', modes(p_item));
+    apex_json.write('maxBytes', max_bytes(p_item));
+    apex_json.write('allowance', c_allow);
+    apex_json.write('warnPct', num(attr(p_item, 3), 80));
+    apex_json.write('maxDuration', num(attr(p_item, 4), 0));
+    apex_json.write('maxCount', num(attr(p_item, 5), 1));
+    apex_json.write('quality', nvl(attr(p_item, 6), 'BALANCED'));
+    apex_json.write('audioKbps', num(attr(p_item, 7), 48));
+    apex_json.write('videoHeight', num(attr(p_item, 8), 480));
+    apex_json.write('videoKbps', num(attr(p_item, 9), 900));
+    apex_json.write('fps', num(attr(p_item, 10), 24));
+    apex_json.write('audioOptions', nvl(attr(p_item, 11), '-'));
+    apex_json.write('format', nvl(attr(p_item, 12), 'AUTO'));
+    apex_json.write('features', nvl(attr(p_item, 13), '-'));
+    apex_json.write('camera', nvl(attr(p_item, 14), 'environment'));
+    apex_json.write('style', nvl(attr(p_item, 15), 'FULL'));
+    apex_json.write('fileName', nvl(attr(p_item, 17), '#ITEM#-#TIMESTAMP#'));
+    apex_json.write('transcription', case when attr(p_item, 19) = 'SERVER' and attr(p_item, 24) is null then 'NONE' else nvl(attr(p_item, 19), 'NONE') end);
+    apex_json.write('transcriptLanguages', attr(p_item, 20));
+    apex_json.write('transcriptItem', attr(p_item, 21));
+    apex_json.write('allowRequests', nvl(attr(p_item, 22), 'CANCEL,DELETE'));
+    apex_json.write('buttons', nvl(attr(p_item, 23), 'ROUNDED'));
+    apex_json.write('imageFormat', nvl(attr(p_item, 25), 'JPEG'));
+    apex_json.write('imageQuality', num(attr(p_item, 26), 85));
+    apex_json.write('imageMaxSide', num(attr(p_item, 27), 1920));
+    apex_json.write('imageTools', nvl(attr(p_item, 28), '-'));
+    apex_json.write('cropRatio', nvl(attr(p_item, 29), 'FREE'));
+    apex_json.write('appId', v('APP_ID'));
+    apex_json.write('pageId', v('APP_PAGE_ID'));
+    apex_json.write('readOnly', l_ro);
+
+    -- recordings of this item still waiting in the collection (e.g. after a validation error)
+    apex_json.open_array('items');
+    if apex_collection.collection_exists(l_coll) then
+        for r in ( select seq_id, c001, c002, c003, n001, n002, n003, n004, clob001
+                     from apex_collections
+                    where collection_name = l_coll
+                      and c004 = l_name
+                      and seq_id in (select column_value from table(l_seqs))
+                    order by seq_id )
+        loop
+            l_value := l_value || case when l_value is not null then ':' end || r.seq_id;
+            apex_json.open_object;
+            apex_json.write('seq', r.seq_id);
+            apex_json.write('name', r.c001);
+            apex_json.write('mime', r.c002);
+            apex_json.write('kind', r.c003);
+            apex_json.write('size', r.n001);
+            apex_json.write('duration', r.n002);
+            apex_json.write('width', r.n003);
+            apex_json.write('height', r.n004);
+            if r.clob001 is not null then apex_json.write('transcript', r.clob001); end if;
+            apex_json.close_object;
+        end loop;
+    end if;
+    apex_json.close_array;
+
+    -- recordings already saved in the application's table
+    apex_json.open_array('saved');
+    if attr(p_item, 18) is not null then
+        begin
+            l_ctx  := apex_exec.open_query_context(p_location => apex_exec.c_location_local_db, p_sql_query => attr(p_item, 18), p_max_rows => 50);
+            l_cols := apex_exec.get_column_count(l_ctx);
+            while apex_exec.next_row(l_ctx) loop
+                l_row  := l_row + 1;
+                l_blob := apex_exec.get_blob(l_ctx, 1);
+                if l_blob is not null and dbms_lob.getlength(l_blob) > 0 then
+                    apex_json.open_object;
+                    apex_json.write('row', l_row);
+                    apex_json.write('size', dbms_lob.getlength(l_blob));
+                    if l_cols > 1 then apex_json.write('mime', apex_exec.get_varchar2(l_ctx, 2)); end if;
+                    if l_cols > 2 then apex_json.write('name', apex_exec.get_varchar2(l_ctx, 3)); end if;
+                    if l_cols > 3 then apex_json.write('duration', apex_exec.get_number(l_ctx, 4)); end if;
+                    if l_cols > 4 then apex_json.write('transcript', apex_exec.get_clob(l_ctx, 5)); end if;
+                    apex_json.close_object;
+                end if;
+            end loop;
+            apex_exec.close(l_ctx);
+        exception
+            when others then
+                apex_exec.close(l_ctx);
+                apex_debug.error('MediaPlus %s saved recordings query: %s', l_name, sqlerrm);
+        end;
+    end if;
+    apex_json.close_array;
+    apex_json.close_object;
+    l_json := apex_json.get_clob_output;
+    apex_json.free_output;
+
+    sys.htp.p('<input type="hidden" id="' || l_name || '" name="' || l_name || '" value="' || apex_escape.html_attribute(l_value) || '">'
+           || '<div id="' || l_name || '_MPLUS" class="mplus' || case when l_ro then ' mplus--ro' end
+           || '" role="group" aria-label="' || apex_escape.html_attribute(p_item.plain_label) || '"></div>');
+    -- settings and recordings as a JSON block (transcripts can be longer than on-load code allows)
+    sys.htp.prn('<script type="application/json" id="' || l_name || '_MPLUS_CFG">');
+    apex_util.prn(replace(l_json, '</', '<\/'), false);
+    sys.htp.p('</script>');
+
+    apex_javascript.add_onload_code(
+        'mediaPlus.init(JSON.parse(document.getElementById("' || l_name || '_MPLUS_CFG").textContent)'
+        || case when p_item.init_javascript_code is not null then ', ' || p_item.init_javascript_code end || ');');
+
+    p_result.is_navigable     := not l_ro;
+    p_result.navigable_dom_id := l_name || '_MPLUS';
+end render;
+
+----------------------------------------------------------------------------
+-- validation: every recording in the value must still be in the collection, and no more than allowed
+----------------------------------------------------------------------------
+procedure validation (
+    p_item   in            apex_plugin.t_item,
+    p_plugin in            apex_plugin.t_plugin,
+    p_param  in            apex_plugin.t_item_validation_param,
+    p_result in out nocopy apex_plugin.t_item_validation_result )
+is
+    l_coll  varchar2(255) := coll(p_item);
+    l_item  varchar2(255) := p_item.name;
+    l_seqs  apex_t_number := seqs(p_param.value);
+    l_count pls_integer := 0;
+begin
+    if p_param.value is null then
+        return;
+    end if;
+    if apex_collection.collection_exists(l_coll) then
+        select count(*)
+          into l_count
+          from apex_collections
+         where collection_name = l_coll
+           and c004 = l_item
+           and seq_id in (select column_value from table(l_seqs));
+    end if;
+    if l_count = 0 or l_count <> l_seqs.count then
+        p_result.message := msg('EXPIRED', '%0: a recording or photo is no longer available. Please add it again.', p_item.plain_label);
+    elsif l_count > greatest(1, num(attr(p_item, 5), 1)) then
+        p_result.message := msg('TOO_MANY', '%0: there are more than allowed.', p_item.plain_label);
+    end if;
+end validation;

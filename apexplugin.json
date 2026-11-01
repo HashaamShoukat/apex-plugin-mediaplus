@@ -1,0 +1,34 @@
+{
+  "name" : "MediaPlus",
+  "version" : "2.0.0",
+  "description" : "One page item that records audio and video and takes photos, on phones and desktops: record, pause, resume, review, record again; size and length limits with an early warning and an automatic stop; a photo editor with crop (free or fixed shapes), rotate, flip, brightness, contrast, colour, black and white, drawing and resize; MP4 / M4A that play and seek in every player; live transcription in English or Arabic, or your own speech service; drafts that survive a reload; everything kept in an APEX collection until your page saves it into your own table. No database objects needed.",
+  "keywords" : ["audio", "video", "photo", "camera", "recorder", "voice note", "image editor", "crop", "upload", "item"],
+  "homepage" : "https://github.com/HashaamShoukat/apex-plugin-mediaplus",
+  "bugs" : {
+    "url" : "https://github.com/HashaamShoukat/apex-plugin-mediaplus/issues",
+    "email" : "hashaam.shoukat@gmail.com"
+  },
+  "license" : "MIT",
+  "commercial" : "No",
+  "author" : {
+    "name" : "Hashaam Shoukat",
+    "email" : "hashaam.shoukat@gmail.com",
+    "url" : "https://github.com/HashaamShoukat"
+  },
+  "repository" : {
+    "type" : "git",
+    "url" : "https://github.com/HashaamShoukat/apex-plugin-mediaplus.git"
+  },
+  "oracle" : {
+    "versions" : ["19.0.0", "21.0.0", "23.0.0"],
+    "apex" : {
+      "versions" : ["24.1.0", "24.2.0", "26.1.0"],
+      "plugin" : {
+        "internalName" : "COM.HASHAAM.MEDIAPLUS",
+        "type" : "item",
+        "demo" : "https://oracleapex.com/ords/r/hashaam-admin/apex-plugins-by-hbs/mediaplus",
+        "previewImage" : "https://raw.githubusercontent.com/HashaamShoukat/apex-plugin-mediaplus/main/docs/images/photo-editor.png"
+      }
+    }
+  }
+}

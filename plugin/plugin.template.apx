@@ -1,0 +1,66 @@
+plugin mediaPlus (
+    name: MediaPlus
+    staticId: COM.HASHAAM.MEDIAPLUS
+    type: item
+    component {
+        supports: [
+            pageItems
+        ]
+        supportsSessionStateDataTypes: [
+            varchar2
+        ]
+        standardAttributes: [
+            visibleWidget
+            standardFormElement
+            sessionStateChangeable
+            readOnlyAttr
+            sourceAttrs
+            initJavascriptCodeAttr
+        ]
+    }
+    source {
+        plsqlCode:
+            ```plsql
+@@PLSQL@@
+            ```
+    }
+    callbacks {
+        renderProcedureName: render
+        ajaxProcedureName: ajax
+        validationProcedureName: validation
+    }
+    css {
+        fileUrls: #PLUGIN_FILES#css/mediaPlus#MIN#.css?v=@@VERSION@@
+    }
+    javaScript {
+        fileUrls: #PLUGIN_FILES#js/mediaPlus#MIN#.js?v=@@VERSION@@
+    }
+    information {
+        version: @@VERSION@@
+        helpText:
+            ```
+            MediaPlus records audio and video and takes photos right in the page - on phones and desktops - and keeps each one in an APEX collection until your page process saves it into your own table. Mode can be any one, two or all three of Audio, Video and Photo; with more than one, users pick.
+
+            Recordings: record, pause and resume, stop, then listen to or watch it before using it. A meter shows the size used; at the Warning Threshold users are warned, and at the Maximum File Size (or Maximum Length) recording stops by itself. Quality (bit rate, resolution, frame rate, mono) keeps files small. Recordings are repaired after recording, so they play and seek in every player (Windows Media Player, VLC, phones).
+
+            Photos: take one with the camera or choose a file, then crop (free or a fixed shape), turn, flip, adjust brightness, contrast and colour, make it black and white, draw on it, and pick a size. The photo is saved as JPEG, WebP or PNG and compressed until it fits the Maximum File Size; its EXIF data (such as the location) is removed.
+
+            The item value is the list of collection SEQ_IDs, separated by colons. Save them in a page process after the item is submitted:
+
+            insert into my_media (title, media, mime_type, file_name, file_size, duration_sec, media_kind)
+            select :P10_TITLE, blob001, c002, c001, n001, n002, c003
+              from apex_collections
+             where collection_name = 'MEDIAPLUS'
+               and seq_id in (select column_value from table(apex_string.split_numbers(:P10_MEDIA, ':')));
+
+            Collection columns: C001 file name, C002 MIME type, C003 AUDIO, VIDEO or IMAGE, C004 item name, N001 size in bytes, N002 length in seconds, N003 / N004 photo width / height, D001 created, BLOB001 the file, CLOB001 transcript. Members nobody saved are removed after an hour.
+
+            Saved Recordings Query shows files that are already in your table (play, view and download - e.g. on an edit page or in read-only mode).
+
+            The camera and microphone need a secure (https) page. Without them users can still pick a file or open the phone's own camera or recorder.
+
+            JavaScript: mediaPlus.get("P10_MEDIA").start() / pause() / resume() / stop() / capture() / use() / discard() / kind() / state() / isBusy() / recordings(). Texts can be translated with text messages MEDIAPLUS.<KEY> (see the README).
+            ```
+    }
+
+)
