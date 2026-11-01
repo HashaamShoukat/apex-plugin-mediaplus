@@ -4,10 +4,11 @@
 
 An item plug-in that **records audio and video and takes photos** in the page, on phones and desktops. Choose any one, two or all three; with more than one, users pick with a switch.
 
-| Recording, with live transcription | Photo editor |
+![MediaPlus preview](docs/images/preview.png)
+
+| Photo editor | Review before use |
 |---|---|
-| ![Recording a voice note](docs/images/recording.png) | ![Photo editor](docs/images/photo-editor.png) |
-| ![Review before use](docs/images/review.png) | ![Photos in the item](docs/images/photos.png) |
+| ![Photo editor](docs/images/photo-editor.png) | ![Review before use](docs/images/review.png) |
 
 **[Live demo](https://oracleapex.com/ords/r/hashaam-admin/apex-plugins-by-hbs/mediaplus)** (demo / Demo@2026) · [Install](#install) · [Photos](#photos) · [Save into your table](#save-into-your-table) · [JavaScript](#javascript) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/HashaamShoukat/apex-plugin-mediaplus/issues)
 

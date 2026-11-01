@@ -27,7 +27,7 @@
         "internalName" : "COM.HASHAAM.MEDIAPLUS",
         "type" : "item",
         "demo" : "https://oracleapex.com/ords/r/hashaam-admin/apex-plugins-by-hbs/mediaplus",
-        "previewImage" : "https://raw.githubusercontent.com/HashaamShoukat/apex-plugin-mediaplus/main/docs/images/photo-editor.png"
+        "previewImage" : "https://raw.githubusercontent.com/HashaamShoukat/apex-plugin-mediaplus/main/docs/images/preview.png"
       }
     }
   }
